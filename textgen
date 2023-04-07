@@ -1,0 +1,284 @@
+#!/bin/bash
+
+function show_help {
+  cat << EOF
+Usage: $(basename "${0}") [OPTIONS]
+
+Options:
+  -h, --help                      Display this help message and exit
+  -s, --stream                    Enable streaming text output
+  -C, --cai-chat, --cai_chat      Enable chatbot mode
+  -N, --notebook                  Enable notebook mode
+      --settings-file             Specify the path to the settings file
+  -t, --threads <NUM_THREADS>     Set the number of threads (0-16)
+  -m, --model <MODEL_NAME>        Set the model name
+      --model-dir                 Set the model directory
+      --webui-path                Set the webui path
+      --conda-env                 Set the conda environment
+  -U, --update                    Check for updates and exit
+
+EOF
+  exit 0
+}
+
+function error {
+  echo -e "\e[31merror:\e[0m ${@:-unknown error}"
+  exit 1
+}
+
+function startup {
+  webui_path="/home/${USER}/text-generation-webui"
+  auth_file="${webui_path}/settings/gradio-auth.txt"
+  model_dir="/media/${USER}/models/text"
+  model_name="facebook_LLaMA-7b"
+  auth_login="false"
+  chatbot_mode="false"
+  check_for_updates="false"
+  conda_env="textgen"
+  listen="true"
+  notebook_mode="true"
+  settings_file=""
+  share="false"
+  stream="false"
+  thread_count="4"
+
+  # Parse options
+  while [[ "${#}" -gt 0 ]]; do
+    case "${1}" in
+      --help|-h)
+        show_help
+        ;;
+      --stream|-s)
+        stream="true"
+        ;;
+      --chat|--cai-chat|--cai_chat|-C)
+        chatbot_mode="true"
+        notebook_mode="false"
+        ;;
+      --notebook|-N)
+        chatbot_mode="false"
+        notebook_mode="true"
+        ;;
+      --settings-file|--settings_file|--settings)
+        if [[ -z "${2}" || "${2}" = '-'* ]]; then
+          error "missing argument for '${1}'"
+        else
+          settings_file="${2}"
+          shift
+        fi
+        ;;
+      --threads|-t)
+        if [[ -z "${2}" || "${2}" = -* ]]; then
+          error "missing argument for '${1}'"
+        elif ! [[ "${2}" =~ ^[0-9]+$ ]] || (( "${2}" < 0 || "${2}" > 16 )); then
+          error "invalid argument for '${1}': '${2}'. Must be an integer between 0 and 16."
+        else
+          thread_count="${2}"
+          shift
+        fi
+        ;;
+      --model|-m)
+        if [[ -z "${2}" || "${2}" = '-'* ]]; then
+          error "missing argument for '${1}'"
+        else
+          model_name="${2}"
+          shift
+        fi
+        ;;
+      --model-dir|--model_dir)
+        if [[ -z "${2}" || "${2}" = '-'* ]]; then
+          error "missing argument for '${1}'"
+        else
+          model_dir="${2}"
+          shift
+        fi
+        ;;
+      --webui-path|--webui_path)
+        if [[ -z "${2}" || "${2}" = '-'* ]]; then
+          error "missing argument for '${1}'"
+        else
+          webui_path="${2}"
+          shift
+        fi
+        ;;
+      --conda-env|--conda_env|--env)
+        if [[ -z "${2}" || "${2}" = '-'* ]]; then
+          error "missing argument for '${1}'"
+        else
+          conda_env="${2}"
+          shift
+        fi
+        ;;
+      --update|-U)
+        check_for_updates="true"
+        ;;
+      *)
+        error "unknown option: ${1}"
+        exit 1
+        ;;
+  esac; shift; done
+
+  # Ensure webui_path is set & exists, and cd into it
+  if [[ -z "${webui_path}" ]]; then
+    error "unset variable: ${webui_path}"
+  elif [[ ! -d "${webui_path}" ]]; then
+    error "missing directory: ${webui_path}"
+  elif ! cd "${webui_path}"; then
+    error "failed to change directories to '${webui_path}'"
+  fi
+
+  # Update webui if enabled
+  if [[ "${check_for_updates}" = true ]]; then
+    update_webui
+  fi
+
+  # Ensure model_dir is set & exists
+  if [[ -z "${model_dir}" ]]; then
+    error "unset variable: ${model_dir}"
+  elif [[ ! -d "${model_dir}" ]]; then
+    error "missing model directory: ${model_dir}"
+  fi
+
+  # Ensure the model exists if model_name is set
+  if [[ -n "${model_name}" ]]; then
+    local model_path="${model_dir}/${model_name}"
+    if [[ ! -d "${model_path}" ]]; then
+      error "model not found: ${model}"
+    fi
+  fi
+
+  # Ensure settings_file exists if set
+  if [[ -n "${settings_file}" && ! -f "${settings_file}" ]]; then
+    error "missing file: ${settings_file}"
+  fi
+}
+
+function update_webui {
+  # Attempt to activate the Conda environment
+  if ! activate_conda_environment; then
+    error "failed to activate conda environment"
+  fi
+
+  # Check if the git command is available
+  if ! command -v git &> /dev/null; then
+    error "missing package: git"
+  fi
+
+  # Attempt to pull the latest changes from the Git repository
+  if ! git pull; then
+    error "failed to check for updates: $(git log -1 --pretty=%B)"
+  fi
+
+  # Declare local variables to store timestamps
+  local req_ts
+  local curr_ts
+
+  # Get the timestamp of the last commit that modified requirements.txt
+  req_ts="$(git log -1 --format=%at requirements.txt)"
+  # Get the timestamp of the current Git commit
+  curr_ts="$(git log -1 --format=%at)"
+
+  # Check if requirements.txt was updated more recently than the current commit
+  if [[ "${req_ts}" -gt "${curr_ts}" ]]; then
+    echo "updating requirements..."
+    # Attempt to update the required Python packages
+    if ! pip install -r requirements.txt --upgrade --quiet; then
+      error "failed to update required packages"
+    fi
+  fi
+
+  # Exit the script
+  exit 0
+}
+
+function activate_conda_environment {
+  # Check if the conda_env variable is set
+  if [[ -z "${conda_env}" ]]; then
+    error "unset variable: ${conda_env}"
+  fi
+
+  # Source the Conda profile script to enable Conda commands
+  source ~/anaconda3/etc/profile.d/conda.sh
+
+  # Get a list of available Conda environments
+  local env_list="$(conda env list | awk '{print $1}')"
+
+  # Check if the specified Conda environment exists
+  if [[ ! "${env_list}" =~ (^|[[:space:]])"${conda_env}"($|[[:space:]]) ]]; then
+    error "${conda_env} env not found"
+  fi
+
+  # Check if the specified Conda environment is not the currently active one
+  if [[ ! "${CONDA_DEFAULT_ENV}" = "${conda_env}" ]]; then
+    # Attempt to activate the specified Conda environment
+    if ! conda activate "${conda_env}"; then
+      error "failed to activate conda environment: ${conda_env}"
+    fi
+  fi
+}
+
+function start_textgen_server {
+  typeset -a options=("--cpu")
+
+  # Specify model dir
+  if [[ -n "${model_dir}" ]]; then
+    options+=("--model-dir" "${model_dir}")
+  fi
+
+  # Specify model
+  if [[ -n "${model_name}" ]]; then
+    options+=("--model" "${model_name}")
+  fi
+
+  # Enable LLaMA specific options
+  if [[ "${model_name}" == *'LLaMA'* && -n "${thread_count}" ]]; then
+    options+=("--threads" "${thread_count}")
+  fi
+
+  # Specify inference mode
+  if [[ "${chatbot_mode}" = true ]]; then
+    options+=("--cai-chat")
+  elif [[ "${notebook_mode}" = true ]]; then
+    options+=("--notebook")
+  fi
+
+  # Disable streaming text
+  if [[ "${stream}" = true ]]; then
+    options+=("--no-stream")
+  fi
+
+  # Enable sharing to the local network
+  if [[ "${listen}" = true ]]; then
+    options+=("--listen")
+  fi
+
+  # Enable public link
+  if [[ "${share}" = true ]]; then
+    options+=("--share")
+  fi
+
+  # Enable login authentication
+  if [[ "${auth_login}" = true ]]; then
+    options+=("--gradio-auth-path" "${auth_file}")
+  fi
+
+  # Enable settings file
+  if [[ -n "${settings_file}" ]]; then
+    options+=("--settings" "${settings_file}")
+  fi
+
+  # Start the text generation server
+  if ! python3 server.py "${options[@]}" 2> /dev/null; then
+    error "failed to start webui"
+  fi
+}
+
+function main {
+  clear
+  startup "${@}"
+  activate_conda_environment
+  start_textgen_server
+  exit 0
+}
+
+main "${@}"
